@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 
 #[derive(serde::Deserialize)]
 struct Request {
+    #[serde(default)]
     id: Value,
     method: String,
     #[serde(default)]
@@ -27,6 +28,31 @@ fn ua_client() -> anyhow::Result<reqwest::Client> {
         .user_agent("Mozilla/5.0 (gray-search/0.1)")
         .timeout(std::time::Duration::from_secs(20))
         .build()?)
+}
+
+/// The plugin manifest, identical on the wire (`plugin/manifest` result)
+/// and on the CLI (`gray-search manifest`, the host's registration probe).
+/// Version tracks Cargo.toml via `env!` so the two can never drift.
+fn manifest_json() -> Value {
+    json!({
+        "name": "search", "version": env!("CARGO_PKG_VERSION"), "protocol": "1.1",
+        "tools": [
+            {"name": "web_search", "description": "Search the web", "parameters": {"type": "object", "properties": {"query": {"type": "string"}, "max_results": {"type": "integer"}, "provider": {"type": "string"}}, "required": ["query"]}, "snippet": "web_search <query>"},
+            {"name": "web_fetch", "description": "Fetch a URL and return its text content", "parameters": {"type": "object", "properties": {"url": {"type": "string"}, "max_chars": {"type": "integer"}}, "required": ["url"]}, "snippet": "web_fetch <url>"}
+        ],
+        "commands": ["/search"], "hooks": [],
+    })
+}
+
+/// Shared HTTP client, built lazily on first use. `reqwest::Client::build`
+/// is fallible (TLS backend init, resolver setup); a failure must never
+/// reach startup — before the manifest handshake the host reads ANY exit
+/// as "sidecar failed to spawn". The cell retries on the next request and
+/// a build failure surfaces as a tool error, not a spawn failure.
+type HttpCell = tokio::sync::OnceCell<reqwest::Client>;
+
+async fn http_client(cell: &HttpCell) -> anyhow::Result<&reqwest::Client> {
+    cell.get_or_try_init(|| std::future::ready(ua_client())).await
 }
 
 fn strip_tags(html: &str) -> String {
@@ -123,7 +149,11 @@ async fn bing(http: &reqwest::Client, q: &str, n: usize) -> anyhow::Result<Optio
     for c in re.captures_iter(&html) {
         let title = strip_tags(&c[2]);
         let end = c.get(0).unwrap().end();
-        let window = &html[end..(end + 2000).min(html.len())];
+        let mut stop = (end + 2000).min(html.len());
+        while !html.is_char_boundary(stop) {
+            stop -= 1;
+        }
+        let window = &html[end..stop];
         let snippet = Regex::new(r"(?s)<p[^>]*>(.*?)</p>")?.captures(window)
             .and_then(|p| p.get(1)).map(|p| strip_tags(p.as_str())).unwrap_or_default();
         out.push(Result_ { title, url: bing_link(&c[1]), snippet });
@@ -174,57 +204,79 @@ async fn search(http: &reqwest::Client, query: &str, n: usize, pinned: Option<&s
     Err(if errors.is_empty() { "no provider configured".into() } else { errors.join("; ") })
 }
 
+fn main() {
+    // Registration probe: `gray-search manifest` prints the manifest JSON
+    // and exits 0. It must run ahead of every fallible init — the host
+    // invokes it before writing a single frame, and a silent exit there is
+    // reported as a spawn failure.
+    if std::env::args().nth(1).as_deref() == Some("manifest") {
+        println!("{}", manifest_json());
+        return;
+    }
+    if let Err(e) = run() {
+        // stdout carries protocol frames only; diagnostics go to stderr.
+        eprintln!("gray-search: fatal: {e:#}");
+        std::process::exit(1);
+    }
+}
+
 #[tokio::main(flavor = "multi_thread")]
-async fn main() -> anyhow::Result<()> {
+async fn run() -> anyhow::Result<()> {
     let mut lines = tokio::io::AsyncBufReadExt::lines(tokio::io::BufReader::new(tokio::io::stdin()));
-    let http = ua_client()?;
+    // Nothing fallible may run between here and the read loop: the host
+    // treats a pre-handshake exit as a spawn failure. The HTTP client is
+    // built on first tool use instead.
+    let http = HttpCell::new();
     let mut stdout = std::io::stdout();
     while let Some(line) = lines.next_line().await? {
         if line.trim().is_empty() { continue; }
         let request: Request = match serde_json::from_str(&line) { Ok(r) => r, Err(_) => continue };
         if request.method == "plugin/shutdown" { break; }
+        if request.id.is_null() { continue; }
         let params = request.params.clone().unwrap_or_else(|| json!({}));
         let reply: anyhow::Result<Value> = match request.method.as_str() {
-            "plugin/manifest" => Ok(json!({
-                "name": "search", "version": "0.1.0", "protocol": "1.1",
-                "tools": [
-                    {"name": "web_search", "description": "Search the web", "parameters": {"type": "object", "properties": {"query": {"type": "string"}, "max_results": {"type": "integer"}, "provider": {"type": "string"}}, "required": ["query"]}, "snippet": "web_search <query>"},
-                    {"name": "web_fetch", "description": "Fetch a URL and return its text content", "parameters": {"type": "object", "properties": {"url": {"type": "string"}, "max_chars": {"type": "integer"}}, "required": ["url"]}, "snippet": "web_fetch <url>"}
-                ],
-                "commands": ["/search"], "hooks": [],
-            })),
+            "plugin/manifest" => Ok(manifest_json()),
             "command/run" => {
                 let argv: Vec<String> = params.get("argv").and_then(Value::as_array)
                     .map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect()).unwrap_or_default();
-                match search(&http, &argv.join(" "), 8, None).await {
-                    Ok((name, results)) => Ok(json!({"text": format!("[{name}] {}", serde_json::to_string_pretty(&results).unwrap_or_default()).chars().take(4000).collect::<String>()})),
-                    Err(e) => Ok(json!({"text": format!("search failed: {e}")})),
+                match http_client(&http).await {
+                    Err(e) => Ok(json!({"text": format!("search failed: {e:#}")})),
+                    Ok(http) => match search(http, &argv.join(" "), 8, None).await {
+                        Ok((name, results)) => Ok(json!({"text": format!("[{name}] {}", serde_json::to_string_pretty(&results).unwrap_or_default()).chars().take(4000).collect::<String>()})),
+                        Err(e) => Ok(json!({"text": format!("search failed: {e}")})),
+                    },
                 }
             }
             "tool/call" => {
                 let name = params.get("name").and_then(Value::as_str).unwrap_or("");
                 let args = params.get("args").cloned().unwrap_or(json!({}));
                 match name {
-                    "web_search" => {
-                        let q = args.get("query").and_then(Value::as_str).unwrap_or("");
-                        let n = args.get("max_results").and_then(Value::as_u64).unwrap_or(8) as usize;
-                        let pinned = args.get("provider").and_then(Value::as_str);
-                        match search(&http, q, n, pinned).await {
-                            Ok((pname, results)) => Ok(json!({"content": serde_json::to_string_pretty(&json!({"provider": pname, "results": results})).unwrap_or_default().chars().take(8000).collect::<String>()})),
-                            Err(e) => Ok(json!({"content": format!("error: {e}"), "is_error": true})),
-                        }
-                    }
-                    "web_fetch" => {
-                        let url = args.get("url").and_then(Value::as_str).unwrap_or("");
-                        let max = args.get("max_chars").and_then(Value::as_u64).unwrap_or(8000) as usize;
-                        match http.get(url).send().await {
-                            Ok(resp) => match resp.text().await {
-                                Ok(html) => Ok(json!({"content": strip_tags(&html).chars().take(max).collect::<String>()})),
+                    "web_search" => match http_client(&http).await {
+                        Err(e) => Ok(json!({"content": format!("error: {e:#}"), "is_error": true})),
+                        Ok(http) => {
+                            let q = args.get("query").and_then(Value::as_str).unwrap_or("");
+                            let n = args.get("max_results").and_then(Value::as_u64).unwrap_or(8) as usize;
+                            let pinned = args.get("provider").and_then(Value::as_str);
+                            match search(http, q, n, pinned).await {
+                                Ok((pname, results)) => Ok(json!({"content": serde_json::to_string_pretty(&json!({"provider": pname, "results": results})).unwrap_or_default().chars().take(8000).collect::<String>()})),
                                 Err(e) => Ok(json!({"content": format!("error: {e}"), "is_error": true})),
-                            },
-                            Err(e) => Ok(json!({"content": format!("error: {e}"), "is_error": true})),
+                            }
                         }
-                    }
+                    },
+                    "web_fetch" => match http_client(&http).await {
+                        Err(e) => Ok(json!({"content": format!("error: {e:#}"), "is_error": true})),
+                        Ok(http) => {
+                            let url = args.get("url").and_then(Value::as_str).unwrap_or("");
+                            let max = args.get("max_chars").and_then(Value::as_u64).unwrap_or(8000) as usize;
+                            match http.get(url).send().await {
+                                Ok(resp) => match resp.text().await {
+                                    Ok(html) => Ok(json!({"content": strip_tags(&html).chars().take(max).collect::<String>()})),
+                                    Err(e) => Ok(json!({"content": format!("error: {e}"), "is_error": true})),
+                                },
+                                Err(e) => Ok(json!({"content": format!("error: {e}"), "is_error": true})),
+                            }
+                        }
+                    },
                     _ => Ok(json!({"content": format!("error: unknown tool {name}"), "is_error": true})),
                 }
             }
