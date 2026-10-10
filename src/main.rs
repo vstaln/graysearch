@@ -141,7 +141,7 @@ fn bing_link(raw: &str) -> String {
 }
 
 async fn bing(http: &reqwest::Client, q: &str, n: usize) -> anyhow::Result<Option<Vec<Result_>>> {
-    let url = format!("https://www.bing.com/search?q={}&count={}",
+    let url = format!("https://www.bing.com/search?q={}&count={}&mkt=en-US&setlang=en",
         url::form_urlencoded::byte_serialize(q.as_bytes()).collect::<String>(), n);
     let html = http.get(&url).send().await?.text().await?;
     let re = Regex::new(r#"(?s)<h2[^>]*><a[^>]*href="([^"]+)"[^>]*>(.*?)</a></h2>"#)?;
