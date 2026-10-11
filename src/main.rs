@@ -1,6 +1,14 @@
 //! gray-search: web search sidecar (protocol v1.1).
 //! Tools: web_search, web_fetch. Command: /search <query>.
-//! Provider chain: pinned > searxng > tavily > brave > exa > bing > duckduckgo.
+//! Provider chain: pinned > searxng > tavily > brave > exa > duckduckgo > bing > github.
+//! Keyless tier: tavily (X-Tavily-Access-Mode: keyless) and exa
+//! (mcp.exa.ai) are real APIs that answer without keys — the same
+//! providers opencode ships. Scrapers (duckduckgo html/lite, bing) sit
+//! below them: bing serves spam/poisoned SERPs to scrape UAs, so its
+//! results must pass a relevance gate and any failure falls through
+//! rather than surfacing poison. GitHub's
+//! repo-search JSON API is keyless and sits last: wrong shape for
+//! non-dev questions, but it stays reachable where SERPs are blocked.
 
 use std::io::Write;
 
@@ -23,9 +31,18 @@ struct Result_ {
     snippet: String,
 }
 
+/// A real desktop-Chrome UA + browser headers: a self-identifying bot UA
+/// is what buckets the client into "scrape traffic" (poisoned/degraded
+/// SERPs), and reqwest already picks up HTTPS_PROXY/http_proxy env vars
+/// automatically, so a clean egress proxy fixes every provider at once.
 fn ua_client() -> anyhow::Result<reqwest::Client> {
     Ok(reqwest::Client::builder()
-        .user_agent("Mozilla/5.0 (gray-search/0.1)")
+        .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+        .default_headers({
+            let mut h = reqwest::header::HeaderMap::new();
+            h.insert(reqwest::header::ACCEPT_LANGUAGE, "en-US,en;q=0.9".parse().unwrap());
+            h
+        })
         .timeout(std::time::Duration::from_secs(20))
         .build()?)
 }
@@ -37,7 +54,7 @@ fn manifest_json() -> Value {
     json!({
         "name": "search", "version": env!("CARGO_PKG_VERSION"), "protocol": "1.1",
         "tools": [
-            {"name": "web_search", "description": "Search the web", "parameters": {"type": "object", "properties": {"query": {"type": "string"}, "max_results": {"type": "integer"}, "provider": {"type": "string"}}, "required": ["query"]}, "snippet": "web_search <query>"},
+            {"name": "web_search", "description": "Search the web (keyless: tavily, exa, duckduckgo, bing, github; better with SEARXNG_BASE_URL, TAVILY_API_KEY, BRAVE_API_KEY, or EXA_API_KEY set)", "parameters": {"type": "object", "properties": {"query": {"type": "string"}, "max_results": {"type": "integer"}, "provider": {"type": "string"}}, "required": ["query"]}, "snippet": "web_search <query>"},
             {"name": "web_fetch", "description": "Fetch a URL and return its text content", "parameters": {"type": "object", "properties": {"url": {"type": "string"}, "max_chars": {"type": "integer"}}, "required": ["url"]}, "snippet": "web_fetch <url>"}
         ],
         "commands": ["/search"], "hooks": [],
@@ -83,11 +100,26 @@ async fn searxng(http: &reqwest::Client, q: &str, n: usize) -> anyhow::Result<Op
     }).collect()))
 }
 
+/// Tavily — a real search API that also answers with NO key: the
+/// `X-Tavily-Access-Mode: keyless` header (the mode opencode uses by
+/// default) gets rate-limited keyless access. A configured
+/// TAVILY_API_KEY upgrades to Bearer auth.
 async fn tavily(http: &reqwest::Client, q: &str, n: usize) -> anyhow::Result<Option<Vec<Result_>>> {
     let key = std::env::var("TAVILY_API_KEY").unwrap_or_default();
-    if key.is_empty() { return Ok(None); }
-    let d: Value = http.post("https://api.tavily.com/search")
-        .json(&json!({"api_key": key, "query": q, "max_results": n})).send().await?.json().await?;
+    let req = http
+        .post("https://api.tavily.com/search")
+        .json(&json!({
+            "query": q,
+            "search_depth": "basic",
+            "chunks_per_source": 3,
+            "max_results": n,
+        }));
+    let req = if key.is_empty() {
+        req.header("X-Tavily-Access-Mode", "keyless")
+    } else {
+        req.bearer_auth(key)
+    };
+    let d: Value = req.send().await?.error_for_status()?.json().await?;
     Ok(Some(d["results"].as_array().unwrap_or(&vec![]).iter().take(n).map(|r| Result_ {
         title: r["title"].as_str().unwrap_or("").into(),
         url: r["url"].as_str().unwrap_or("").into(),
@@ -109,16 +141,82 @@ async fn brave(http: &reqwest::Client, q: &str, n: usize) -> anyhow::Result<Opti
     }).collect()))
 }
 
+/// Exa — keyless via their public MCP endpoint `mcp.exa.ai/mcp` (the same
+/// path opencode uses): a JSON-RPC `tools/call` on `web_search_exa`
+/// answers over streamable HTTP without an initialize handshake.
+/// EXA_API_KEY is appended as `?exaApiKey=` when configured.
 async fn exa(http: &reqwest::Client, q: &str, n: usize) -> anyhow::Result<Option<Vec<Result_>>> {
     let key = std::env::var("EXA_API_KEY").unwrap_or_default();
-    if key.is_empty() { return Ok(None); }
-    let d: Value = http.post("https://api.exa.ai/search").header("x-api-key", key)
-        .json(&json!({"query": q, "numResults": n})).send().await?.json().await?;
-    Ok(Some(d["results"].as_array().unwrap_or(&vec![]).iter().take(n).map(|r| Result_ {
-        title: r["title"].as_str().unwrap_or("").into(),
-        url: r["url"].as_str().unwrap_or("").into(),
-        snippet: r["text"].as_str().unwrap_or("").into(),
-    }).collect()))
+    let endpoint = if key.is_empty() {
+        "https://mcp.exa.ai/mcp".to_string()
+    } else {
+        format!("https://mcp.exa.ai/mcp?exaApiKey={key}")
+    };
+    let body = http
+        .post(endpoint)
+        .header("Accept", "application/json, text/event-stream")
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "web_search_exa", "arguments": {"query": q, "numResults": n}},
+        }))
+        .send()
+        .await?
+        .error_for_status()?
+        .text()
+        .await?;
+    // Streamable-HTTP SSE: results ride the last `data:` line's
+    // result.content[].text as "---"-separated blocks.
+    let mut text = String::new();
+    for line in body.lines() {
+        if let Some(data) = line.strip_prefix("data:") {
+            if let Ok(v) = serde_json::from_str::<Value>(data.trim()) {
+                if let Some(t) = v["result"]["content"].as_array().and_then(|c| {
+                    c.iter().find_map(|i| i["text"].as_str())
+                }) {
+                    text = t.to_string();
+                }
+            }
+        }
+    }
+    if text.is_empty() {
+        // Some deployments answer plain JSON-RPC instead of SSE.
+        if let Ok(v) = serde_json::from_str::<Value>(&body) {
+            if let Some(t) = v["result"]["content"].as_array().and_then(|c| {
+                c.iter().find_map(|i| i["text"].as_str())
+            }) {
+                text = t.to_string();
+            }
+        }
+    }
+    Ok(Some(parse_exa_blocks(&text)))
+}
+
+/// Split Exa's "Title:/URL:/Highlights:" text blocks into results — a
+/// port of opencode's parseResults.
+fn parse_exa_blocks(text: &str) -> Vec<Result_> {
+    text.split("\n\n---\n\n")
+        .filter_map(|block| {
+            let url = block
+                .lines()
+                .find_map(|l| l.strip_prefix("URL:").map(str::trim))?;
+            let title = block
+                .lines()
+                .find_map(|l| l.strip_prefix("Title:").map(str::trim))
+                .unwrap_or_default();
+            let snippet = block
+                .split_once("Highlights:")
+                .or_else(|| block.split_once("Text:"))
+                .map(|(_, t)| t.trim().chars().take(500).collect())
+                .unwrap_or_default();
+            Some(Result_ {
+                title: title.to_string(),
+                url: url.to_string(),
+                snippet,
+            })
+        })
+        .collect()
 }
 
 fn bing_link(raw: &str) -> String {
@@ -141,7 +239,9 @@ fn bing_link(raw: &str) -> String {
 }
 
 async fn bing(http: &reqwest::Client, q: &str, n: usize) -> anyhow::Result<Option<Vec<Result_>>> {
-    let url = format!("https://www.bing.com/search?q={}&count={}&mkt=en-US&setlang=en",
+    // adlt=strict + cc=US: force SafeSearch on and pin the market — the
+    // geo/low-trust tier is where the porn-spam SERPs come from.
+    let url = format!("https://www.bing.com/search?q={}&count={}&mkt=en-US&setlang=en&cc=US&adlt=strict",
         url::form_urlencoded::byte_serialize(q.as_bytes()).collect::<String>(), n);
     let html = http.get(&url).send().await?.text().await?;
     let re = Regex::new(r#"(?s)<h2[^>]*><a[^>]*href="([^"]+)"[^>]*>(.*?)</a></h2>"#)?;
@@ -159,38 +259,188 @@ async fn bing(http: &reqwest::Client, q: &str, n: usize) -> anyhow::Result<Optio
         out.push(Result_ { title, url: bing_link(&c[1]), snippet });
         if out.len() >= n { break; }
     }
-    Ok(if out.is_empty() { None } else { Some(out) })
+    // Bing serves spam/poisoned SERPs to scrape UAs (tech queries have
+    // returned literal porn listings). A poisoned page shares no vocabulary
+    // with the query, so drop results without token overlap; an emptied
+    // list becomes None and the chain falls through instead of surfacing
+    // poison.
+    let total = out.len();
+    let kept: Vec<_> = out.into_iter().filter(|r| result_relevant(q, r)).collect();
+    if kept.is_empty() && total > 0 {
+        // Provider answered with results that share no vocabulary with the
+        // query — a poisoned SERP, surfaced as an error (unlike an empty
+        // page, which quietly falls through as unconfigured).
+        return Err(anyhow::anyhow!(
+            "{total} results failed the relevance check — likely a poisoned SERP"
+        ));
+    }
+    Ok(if kept.is_empty() { None } else { Some(kept) })
 }
 
-async fn duckduckgo(http: &reqwest::Client, q: &str, n: usize) -> anyhow::Result<Option<Vec<Result_>>> {
+/// Query-word overlap check: a result counts as real only when some
+/// meaningful query token appears in its title or URL. Bing's poisoned
+/// SERPs fail this outright; one-off synonyms can still drop a legit row,
+/// but the poison case (zero overlap anywhere) is what matters.
+fn result_relevant(query: &str, r: &Result_) -> bool {
+    const STOP: [&str; 16] = [
+        "the", "and", "for", "how", "what", "with", "you", "are", "not",
+        "all", "can", "this", "that", "from", "your", "use",
+    ];
+    let words: Vec<String> = query
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.len() >= 3 && !STOP.contains(w))
+        .map(String::from)
+        .collect();
+    let hay = format!("{} {}", r.title.to_lowercase(), r.url.to_lowercase());
+    let words = if words.is_empty() {
+        query
+            .to_lowercase()
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|w| w.len() >= 3)
+            .map(String::from)
+            .collect()
+    } else {
+        words
+    };
+    words.is_empty() || words.iter().any(|w| hay.contains(w.as_str()))
+}
+
+async fn duckduckgo_html(http: &reqwest::Client, q: &str, n: usize) -> anyhow::Result<Option<Vec<Result_>>> {
     let url = format!("https://html.duckduckgo.com/html/?q={}",
         url::form_urlencoded::byte_serialize(q.as_bytes()).collect::<String>());
     let html = http.get(&url).send().await?.text().await?;
     let re = Regex::new(r#"(?s)class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>"#)?;
     let mut out = vec![];
     for c in re.captures_iter(&html) {
-        let mut link = c[1].to_string();
-        if link.starts_with("//duckduckgo.com/l/") {
-            if let Ok(u) = url::Url::parse(&format!("https:{link}")) {
-                for (k, v) in u.query_pairs() { if k == "uddg" { link = v.to_string(); } }
-            }
-        }
-        out.push(Result_ { title: strip_tags(&c[2]), url: link, snippet: String::new() });
+        out.push(Result_ { title: strip_tags(&c[2]), url: ddg_link(&c[1]), snippet: String::new() });
         if out.len() >= n { break; }
     }
     Ok(if out.is_empty() { None } else { Some(out) })
 }
 
+/// The DDG redirect (`/l/?uddg=…`) both endpoints wrap result URLs in.
+fn ddg_link(raw: &str) -> String {
+    if raw.starts_with("//duckduckgo.com/l/")
+        && let Ok(u) = url::Url::parse(&format!("https:{raw}"))
+    {
+        for (k, v) in u.query_pairs() {
+            if k == "uddg" {
+                return v.to_string();
+            }
+        }
+    }
+    raw.to_string()
+}
+
+/// `lite.duckduckgo.com` — a POST form and a bare table; the most
+/// scrape-friendly DDG surface. Runs when the html endpoint answers an
+/// empty/blocked page.
+async fn duckduckgo_lite(http: &reqwest::Client, q: &str, n: usize) -> anyhow::Result<Option<Vec<Result_>>> {
+    let html = http
+        .post("https://lite.duckduckgo.com/lite/")
+        .form(&[("q", q)])
+        .send()
+        .await?
+        .text()
+        .await?;
+    let re = Regex::new(r#"(?s)<a[^>]*class="result-link"[^>]*href="([^"]+)"[^>]*>(.*?)</a>"#)?;
+    let mut out = vec![];
+    for c in re.captures_iter(&html) {
+        out.push(Result_ {
+            title: strip_tags(&c[2]),
+            url: ddg_link(&c[1]),
+            snippet: String::new(),
+        });
+        if out.len() >= n { break; }
+    }
+    Ok(if out.is_empty() { None } else { Some(out) })
+}
+
+async fn duckduckgo(http: &reqwest::Client, q: &str, n: usize) -> anyhow::Result<Option<Vec<Result_>>> {
+    match duckduckgo_html(http, q, n).await {
+        Ok(Some(r)) => Ok(Some(r)),
+        Ok(None) => duckduckgo_lite(http, q, n).await,
+        Err(e) => {
+            // A dead html endpoint should not mask a working lite one.
+            match duckduckgo_lite(http, q, n).await {
+                Ok(r) => Ok(r),
+                Err(e2) => Err(e2.context(format!("html endpoint also failed: {e:#}"))),
+            }
+        }
+    }
+}
+
+/// GitHub repository search — keyless JSON API (10 req/min unauth), and
+/// api.github.com stays reachable where every HTML SERP is blocked or
+/// serving shells. Last in the chain on purpose: repo-shaped answers are
+/// the wrong shape for non-dev questions, but for "X github" queries
+/// they're better than a dead end. Same relevance gate applies.
+async fn github(http: &reqwest::Client, q: &str, n: usize) -> anyhow::Result<Option<Vec<Result_>>> {
+    // Repo search ANDs every term, so a full sentence ("bytedance UI-TARS
+    // github GUI agent model") matches nothing. Relax progressively:
+    // full query -> meta-words ("github"/"repo") dropped -> top two tokens.
+    let mut tried = std::collections::HashSet::new();
+    for variant in github_query_variants(q) {
+        if !tried.insert(variant.clone()) { continue; }
+        let d: Value = http
+            .get(format!(
+                "https://api.github.com/search/repositories?q={}&per_page={}",
+                url::form_urlencoded::byte_serialize(variant.as_bytes()).collect::<String>(),
+                n
+            ))
+            .header("Accept", "application/vnd.github+json")
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let mut out = vec![];
+        for it in d["items"].as_array().into_iter().flatten() {
+            let url = it["html_url"].as_str().unwrap_or_default();
+            if url.is_empty() { continue; }
+            let name = it["full_name"].as_str().unwrap_or_default();
+            let desc = it["description"].as_str().unwrap_or_default();
+            let stars = it["stargazers_count"].as_u64().unwrap_or(0);
+            out.push(Result_ {
+                title: name.to_string(),
+                url: url.to_string(),
+                snippet: format!("\u{2605}{stars} \u{2014} {desc}"),
+            });
+            if out.len() >= n { break; }
+        }
+        let kept: Vec<_> = out.into_iter().filter(|r| result_relevant(q, r)).collect();
+        if !kept.is_empty() { return Ok(Some(kept)); }
+    }
+    Ok(None)
+}
+
+/// Query relaxations for the AND'd repo search: verbatim, then with
+/// meta-words stripped, then the two leading distinctive tokens.
+fn github_query_variants(q: &str) -> Vec<String> {
+    const META: [&str; 3] = ["github", "repo", "repository"];
+    let meaningful: Vec<&str> = q
+        .split_whitespace()
+        .filter(|w| !META.contains(&w.to_lowercase().as_str()))
+        .collect();
+    let mut v = vec![q.to_string(), meaningful.join(" ")];
+    if meaningful.len() > 2 {
+        v.push(meaningful[..2].join(" "));
+    }
+    v.into_iter().filter(|s| !s.trim().is_empty()).collect()
+}
+
 type Provider<'a> = fn(&'a reqwest::Client, &'a str, usize) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<Option<Vec<Result_>>>> + Send + 'a>>;
 
 async fn search(http: &reqwest::Client, query: &str, n: usize, pinned: Option<&str>) -> Result<(String, Vec<Value>), String> {
-    let providers: [(&str, Provider<'_>); 6] = [
+    let providers: [(&str, Provider<'_>); 7] = [
         ("searxng", |h, q, n| Box::pin(searxng(h, q, n))),
         ("tavily", |h, q, n| Box::pin(tavily(h, q, n))),
         ("brave", |h, q, n| Box::pin(brave(h, q, n))),
         ("exa", |h, q, n| Box::pin(exa(h, q, n))),
-        ("bing", |h, q, n| Box::pin(bing(h, q, n))),
         ("duckduckgo", |h, q, n| Box::pin(duckduckgo(h, q, n))),
+        ("bing", |h, q, n| Box::pin(bing(h, q, n))),
+        ("github", |h, q, n| Box::pin(github(h, q, n))),
     ];
     let mut errors = vec![];
     for (name, f) in providers {

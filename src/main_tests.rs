@@ -46,3 +46,32 @@ async fn search_with_no_keys_and_invalid_pinned_falls_through_all() {
     let err = search(&http, "q", 1, Some("searxng")).await.unwrap_err();
     assert_eq!(err, "no provider configured");
 }
+
+#[test]
+fn relevance_gate_keeps_real_results_and_drops_spam() {
+    let q = "droidrun github";
+    let real = Result_ {
+        title: "droidrun/droidrun: control Android via LLM agents".into(),
+        url: "https://github.com/droidrun/droidrun".into(),
+        snippet: String::new(),
+    };
+    let spam = Result_ {
+        title: "hot singles in your area".into(),
+        url: "https://spam.example/x".into(),
+        snippet: String::new(),
+    };
+    assert!(result_relevant(q, &real));
+    assert!(!result_relevant(q, &spam));
+}
+
+#[test]
+fn relevance_gate_handles_stopword_only_queries() {
+    // A query whose tokens are all stopwords falls back to len>=3 tokens —
+    // it must not vacuously reject everything.
+    let r = Result_ {
+        title: "How to use GitHub".into(),
+        url: "https://docs.github.com/".into(),
+        snippet: String::new(),
+    };
+    assert!(result_relevant("how to", &r));
+}
