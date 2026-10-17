@@ -1,6 +1,6 @@
 [package]
 name = "gray-search"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.91"
 license = "MIT"
@@ -18,6 +18,9 @@ url = { version = "2", features = ["serde"] }
 [[bin]]
 name = "gray-search"
 path = "src/main.rs"
+
+[profile.release]
+strip = true
 
 # Dev builds: full DWARF bloats the binary and every edit pays the link.
 # Line tables keep file:line in panics and backtraces; deps carry none

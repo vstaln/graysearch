@@ -519,10 +519,14 @@ async fn run() -> anyhow::Result<()> {
                             let url = args.get("url").and_then(Value::as_str).unwrap_or("");
                             let max = args.get("max_chars").and_then(Value::as_u64).unwrap_or(8000) as usize;
                             match http.get(url).send().await {
-                                Ok(resp) => match resp.text().await {
-                                    Ok(html) => Ok(json!({"content": strip_tags(&html).chars().take(max).collect::<String>()})),
-                                    Err(e) => Ok(json!({"content": format!("error: {e}"), "is_error": true})),
-                                },
+                                Ok(resp) => {
+                                    let status = resp.status();
+                                    match resp.text().await {
+                                        Ok(html) if status.is_success() => Ok(json!({"content": strip_tags(&html).chars().take(max).collect::<String>()})),
+                                        Ok(_) => Ok(json!({"content": format!("error: HTTP {status} fetching {url}"), "is_error": true})),
+                                        Err(e) => Ok(json!({"content": format!("error: {e}"), "is_error": true})),
+                                    }
+                                }
                                 Err(e) => Ok(json!({"content": format!("error: {e}"), "is_error": true})),
                             }
                         }
@@ -530,7 +534,13 @@ async fn run() -> anyhow::Result<()> {
                     _ => Ok(json!({"content": format!("error: unknown tool {name}"), "is_error": true})),
                 }
             }
-            _ => Ok(json!({})),
+            other => {
+                let r = json!({"id": request.id, "error": {"code": -32601,
+                    "message": format!("method not found: {other}")}});
+                writeln!(stdout, "{r}")?;
+                stdout.flush()?;
+                continue;
+            }
         };
         let response = match reply {
             Ok(result) => json!({"id": request.id, "result": result}),
