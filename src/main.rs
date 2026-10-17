@@ -534,7 +534,13 @@ async fn run() -> anyhow::Result<()> {
                     _ => Ok(json!({"content": format!("error: unknown tool {name}"), "is_error": true})),
                 }
             }
-            _ => Ok(json!({})),
+            other => {
+                let r = json!({"id": request.id, "error": {"code": -32601,
+                    "message": format!("method not found: {other}")}});
+                writeln!(stdout, "{r}")?;
+                stdout.flush()?;
+                continue;
+            }
         };
         let response = match reply {
             Ok(result) => json!({"id": request.id, "result": result}),
