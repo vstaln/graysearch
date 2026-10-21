@@ -10,7 +10,7 @@
 //! repo-search JSON API is keyless and sits last: wrong shape for
 //! non-dev questions, but it stays reachable where SERPs are blocked.
 
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 
 use base64::Engine;
 use regex::Regex;
@@ -454,13 +454,39 @@ async fn search(http: &reqwest::Client, query: &str, n: usize, pinned: Option<&s
     Err(if errors.is_empty() { "no provider configured".into() } else { errors.join("; ") })
 }
 
+const USAGE: &str = "usage: gray-search <query>
+  gray-search <query>    web search (keyless: tavily, exa, duckduckgo, bing, github)
+  gray-search manifest   plugin manifest JSON (the host's registration probe)
+  bare, stdin a pipe     NDJSON sidecar protocol";
+
 fn main() {
-    // Registration probe: `gray-search manifest` prints the manifest JSON
-    // and exits 0. It must run ahead of every fallible init — the host
-    // invokes it before writing a single frame, and a silent exit there is
-    // reported as a spawn failure.
-    if std::env::args().nth(1).as_deref() == Some("manifest") {
-        println!("{}", manifest_json());
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
+        // Registration probe: `gray-search manifest` prints the manifest JSON
+        // and exits 0. It must run ahead of every fallible init — the host
+        // invokes it before writing a single frame, and a silent exit there is
+        // reported as a spawn failure.
+        Some("manifest") => {
+            println!("{}", manifest_json());
+            return;
+        }
+        Some("help") | Some("--help") | Some("-h") => {
+            println!("{USAGE}");
+            return;
+        }
+        // `gray search <query>` forwards the words as argv. Without this arm
+        // the call fell into the sidecar loop and blocked on stdin forever.
+        Some(_) => {
+            if let Err(e) = cli(args.join(" ")) {
+                eprintln!("gray-search: fatal: {e:#}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        None => {}
+    }
+    if std::io::stdin().is_terminal() {
+        eprintln!("gray-search is a plugin sidecar — drive it via `gray search <query>` or install with `gray plugin install`");
         return;
     }
     if let Err(e) = run() {
@@ -468,6 +494,21 @@ fn main() {
         eprintln!("gray-search: fatal: {e:#}");
         std::process::exit(1);
     }
+}
+
+/// `gray search <query>`: the same provider chain the `/search` command and
+/// `web_search` tool use, run once for a shell.
+#[tokio::main(flavor = "multi_thread")]
+async fn cli(query: String) -> anyhow::Result<()> {
+    let http = ua_client()?;
+    match search(&http, &query, 8, None).await {
+        Ok((name, results)) => {
+            let body = serde_json::to_string_pretty(&results)?;
+            println!("[{name}] {}", body.chars().take(4000).collect::<String>());
+        }
+        Err(e) => println!("search failed: {e}"),
+    }
+    Ok(())
 }
 
 #[tokio::main(flavor = "multi_thread")]
