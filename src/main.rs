@@ -11,6 +11,7 @@
 //! non-dev questions, but it stays reachable where SERPs are blocked.
 
 use std::io::{IsTerminal, Write};
+use std::sync::{Arc, Mutex};
 
 use base64::Engine;
 use regex::Regex;
@@ -54,8 +55,8 @@ fn manifest_json() -> Value {
     json!({
         "name": "search", "version": env!("CARGO_PKG_VERSION"), "protocol": "1.1",
         "tools": [
-            {"name": "web_search", "description": "Search the web (keyless: tavily, exa, duckduckgo, bing, github; better with SEARXNG_BASE_URL, TAVILY_API_KEY, BRAVE_API_KEY, or EXA_API_KEY set)", "parameters": {"type": "object", "properties": {"query": {"type": "string"}, "max_results": {"type": "integer"}, "provider": {"type": "string"}}, "required": ["query"]}, "snippet": "web_search <query>"},
-            {"name": "web_fetch", "description": "Fetch a URL and return its text content", "parameters": {"type": "object", "properties": {"url": {"type": "string"}, "max_chars": {"type": "integer"}}, "required": ["url"]}, "snippet": "web_fetch <url>"}
+            {"name": "web_search", "description": "Search the web (keyless: tavily, exa, duckduckgo, bing, github; better with SEARXNG_BASE_URL, TAVILY_API_KEY, BRAVE_API_KEY, or EXA_API_KEY set)", "parameters": {"type": "object", "properties": {"query": {"type": "string"}, "max_results": {"type": "integer"}, "provider": {"type": "string"}}, "required": ["query"]}, "snippet": "web_search <query>", "read_only": true},
+            {"name": "web_fetch", "description": "Fetch a URL and return its text content", "parameters": {"type": "object", "properties": {"url": {"type": "string"}, "max_chars": {"type": "integer"}}, "required": ["url"]}, "snippet": "web_fetch <url>", "read_only": true}
         ],
         "commands": ["/search"], "hooks": [],
     })
@@ -511,20 +512,75 @@ async fn cli(query: String) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn call_tool(params: Value, http: &HttpCell) -> Value {
+    let name = params.get("name").and_then(Value::as_str).unwrap_or("");
+    let args = params.get("args").cloned().unwrap_or(json!({}));
+    match name {
+        "web_search" => match http_client(http).await {
+            Err(e) => json!({"content": format!("error: {e:#}"), "is_error": true}),
+            Ok(http) => {
+                let q = args.get("query").and_then(Value::as_str).unwrap_or("");
+                let n = args.get("max_results").and_then(Value::as_u64).unwrap_or(8) as usize;
+                let pinned = args.get("provider").and_then(Value::as_str);
+                match search(http, q, n, pinned).await {
+                    Ok((pname, results)) => json!({"content": serde_json::to_string_pretty(&json!({"provider": pname, "results": results})).unwrap_or_default().chars().take(8000).collect::<String>()}),
+                    Err(e) => json!({"content": format!("error: {e}"), "is_error": true}),
+                }
+            }
+        },
+        "web_fetch" => match http_client(http).await {
+            Err(e) => json!({"content": format!("error: {e:#}"), "is_error": true}),
+            Ok(http) => {
+                let url = args.get("url").and_then(Value::as_str).unwrap_or("");
+                let max = args.get("max_chars").and_then(Value::as_u64).unwrap_or(8000) as usize;
+                match http.get(url).send().await {
+                    Ok(resp) => {
+                        let status = resp.status();
+                        match resp.text().await {
+                            Ok(html) if status.is_success() => json!({"content": strip_tags(&html).chars().take(max).collect::<String>()}),
+                            Ok(_) => json!({"content": format!("error: HTTP {status} fetching {url}"), "is_error": true}),
+                            Err(e) => json!({"content": format!("error: {e}"), "is_error": true}),
+                        }
+                    }
+                    Err(e) => json!({"content": format!("error: {e}"), "is_error": true}),
+                }
+            }
+        },
+        _ => json!({"content": format!("error: unknown tool {name}"), "is_error": true}),
+    }
+}
+
+fn write_response(stdout: &Mutex<std::io::Stdout>, response: &Value) -> anyhow::Result<()> {
+    let mut out = stdout.lock().unwrap_or_else(|e| e.into_inner());
+    writeln!(out, "{response}")?;
+    out.flush()?;
+    Ok(())
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn run() -> anyhow::Result<()> {
     let mut lines = tokio::io::AsyncBufReadExt::lines(tokio::io::BufReader::new(tokio::io::stdin()));
     // Nothing fallible may run between here and the read loop: the host
     // treats a pre-handshake exit as a spawn failure. The HTTP client is
     // built on first tool use instead.
-    let http = HttpCell::new();
-    let mut stdout = std::io::stdout();
+    let http = Arc::new(HttpCell::new());
+    let stdout = Arc::new(Mutex::new(std::io::stdout()));
     while let Some(line) = lines.next_line().await? {
         if line.trim().is_empty() { continue; }
         let request: Request = match serde_json::from_str(&line) { Ok(r) => r, Err(_) => continue };
         if request.method == "plugin/shutdown" { break; }
         if request.id.is_null() { continue; }
         let params = request.params.clone().unwrap_or_else(|| json!({}));
+        if request.method == "tool/call" {
+            let http = Arc::clone(&http);
+            let stdout = Arc::clone(&stdout);
+            tokio::spawn(async move {
+                let result = call_tool(params, &http).await;
+                let response = json!({"id": request.id, "result": result});
+                let _ = write_response(&stdout, &response);
+            });
+            continue;
+        }
         let reply: anyhow::Result<Value> = match request.method.as_str() {
             "plugin/manifest" => Ok(manifest_json()),
             "command/run" => {
@@ -538,48 +594,10 @@ async fn run() -> anyhow::Result<()> {
                     },
                 }
             }
-            "tool/call" => {
-                let name = params.get("name").and_then(Value::as_str).unwrap_or("");
-                let args = params.get("args").cloned().unwrap_or(json!({}));
-                match name {
-                    "web_search" => match http_client(&http).await {
-                        Err(e) => Ok(json!({"content": format!("error: {e:#}"), "is_error": true})),
-                        Ok(http) => {
-                            let q = args.get("query").and_then(Value::as_str).unwrap_or("");
-                            let n = args.get("max_results").and_then(Value::as_u64).unwrap_or(8) as usize;
-                            let pinned = args.get("provider").and_then(Value::as_str);
-                            match search(http, q, n, pinned).await {
-                                Ok((pname, results)) => Ok(json!({"content": serde_json::to_string_pretty(&json!({"provider": pname, "results": results})).unwrap_or_default().chars().take(8000).collect::<String>()})),
-                                Err(e) => Ok(json!({"content": format!("error: {e}"), "is_error": true})),
-                            }
-                        }
-                    },
-                    "web_fetch" => match http_client(&http).await {
-                        Err(e) => Ok(json!({"content": format!("error: {e:#}"), "is_error": true})),
-                        Ok(http) => {
-                            let url = args.get("url").and_then(Value::as_str).unwrap_or("");
-                            let max = args.get("max_chars").and_then(Value::as_u64).unwrap_or(8000) as usize;
-                            match http.get(url).send().await {
-                                Ok(resp) => {
-                                    let status = resp.status();
-                                    match resp.text().await {
-                                        Ok(html) if status.is_success() => Ok(json!({"content": strip_tags(&html).chars().take(max).collect::<String>()})),
-                                        Ok(_) => Ok(json!({"content": format!("error: HTTP {status} fetching {url}"), "is_error": true})),
-                                        Err(e) => Ok(json!({"content": format!("error: {e}"), "is_error": true})),
-                                    }
-                                }
-                                Err(e) => Ok(json!({"content": format!("error: {e}"), "is_error": true})),
-                            }
-                        }
-                    },
-                    _ => Ok(json!({"content": format!("error: unknown tool {name}"), "is_error": true})),
-                }
-            }
             other => {
-                let r = json!({"id": request.id, "error": {"code": -32601,
+                let response = json!({"id": request.id, "error": {"code": -32601,
                     "message": format!("method not found: {other}")}});
-                writeln!(stdout, "{r}")?;
-                stdout.flush()?;
+                write_response(&stdout, &response)?;
                 continue;
             }
         };
@@ -587,8 +605,7 @@ async fn run() -> anyhow::Result<()> {
             Ok(result) => json!({"id": request.id, "result": result}),
             Err(e) => json!({"id": request.id, "error": {"message": e.to_string()}}),
         };
-        writeln!(stdout, "{}", response)?;
-        stdout.flush()?;
+        write_response(&stdout, &response)?;
     }
     Ok(())
 }
