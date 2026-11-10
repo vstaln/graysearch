@@ -70,7 +70,8 @@ fn manifest_json() -> Value {
 type HttpCell = tokio::sync::OnceCell<reqwest::Client>;
 
 async fn http_client(cell: &HttpCell) -> anyhow::Result<&reqwest::Client> {
-    cell.get_or_try_init(|| std::future::ready(ua_client())).await
+    cell.get_or_try_init(|| std::future::ready(ua_client()))
+        .await
 }
 
 fn strip_tags(html: &str) -> String {
@@ -82,23 +83,48 @@ fn strip_tags(html: &str) -> String {
     let no_js = no_js;
     let re = Regex::new(r"(?s)<[^>]+>").unwrap();
     let no_tags = re.replace_all(&no_js, " ");
-    Regex::new(r"\s+").unwrap().replace_all(&no_tags, " ").trim().to_string()
+    Regex::new(r"\s+")
+        .unwrap()
+        .replace_all(&no_tags, " ")
+        .trim()
+        .to_string()
 }
 
 fn to_json(results: Vec<Result_>) -> Vec<Value> {
-    results.into_iter().map(|r| json!({"title": r.title, "url": r.url, "snippet": r.snippet})).collect()
+    results
+        .into_iter()
+        .map(|r| json!({"title": r.title, "url": r.url, "snippet": r.snippet}))
+        .collect()
 }
 
-async fn searxng(http: &reqwest::Client, q: &str, n: usize) -> anyhow::Result<Option<Vec<Result_>>> {
+async fn searxng(
+    http: &reqwest::Client,
+    q: &str,
+    n: usize,
+) -> anyhow::Result<Option<Vec<Result_>>> {
     let base = std::env::var("SEARXNG_BASE_URL").unwrap_or_default();
-    if base.is_empty() { return Ok(None); }
-    let url = format!("{}/search?q={}&format=json", base.trim_end_matches('/'), url::form_urlencoded::byte_serialize(q.as_bytes()).collect::<String>());
+    if base.is_empty() {
+        return Ok(None);
+    }
+    let url = format!(
+        "{}/search?q={}&format=json",
+        base.trim_end_matches('/'),
+        url::form_urlencoded::byte_serialize(q.as_bytes()).collect::<String>()
+    );
     let d: Value = http.get(&url).send().await?.json().await?;
-    Ok(Some(d["results"].as_array().unwrap_or(&vec![]).iter().take(n).map(|r| Result_ {
-        title: r["title"].as_str().unwrap_or("").into(),
-        url: r["url"].as_str().unwrap_or("").into(),
-        snippet: r["content"].as_str().unwrap_or("").into(),
-    }).collect()))
+    Ok(Some(
+        d["results"]
+            .as_array()
+            .unwrap_or(&vec![])
+            .iter()
+            .take(n)
+            .map(|r| Result_ {
+                title: r["title"].as_str().unwrap_or("").into(),
+                url: r["url"].as_str().unwrap_or("").into(),
+                snippet: r["content"].as_str().unwrap_or("").into(),
+            })
+            .collect(),
+    ))
 }
 
 /// Tavily — a real search API that also answers with NO key: the
@@ -107,39 +133,63 @@ async fn searxng(http: &reqwest::Client, q: &str, n: usize) -> anyhow::Result<Op
 /// TAVILY_API_KEY upgrades to Bearer auth.
 async fn tavily(http: &reqwest::Client, q: &str, n: usize) -> anyhow::Result<Option<Vec<Result_>>> {
     let key = std::env::var("TAVILY_API_KEY").unwrap_or_default();
-    let req = http
-        .post("https://api.tavily.com/search")
-        .json(&json!({
-            "query": q,
-            "search_depth": "basic",
-            "chunks_per_source": 3,
-            "max_results": n,
-        }));
+    let req = http.post("https://api.tavily.com/search").json(&json!({
+        "query": q,
+        "search_depth": "basic",
+        "chunks_per_source": 3,
+        "max_results": n,
+    }));
     let req = if key.is_empty() {
         req.header("X-Tavily-Access-Mode", "keyless")
     } else {
         req.bearer_auth(key)
     };
     let d: Value = req.send().await?.error_for_status()?.json().await?;
-    Ok(Some(d["results"].as_array().unwrap_or(&vec![]).iter().take(n).map(|r| Result_ {
-        title: r["title"].as_str().unwrap_or("").into(),
-        url: r["url"].as_str().unwrap_or("").into(),
-        snippet: r["content"].as_str().unwrap_or("").into(),
-    }).collect()))
+    Ok(Some(
+        d["results"]
+            .as_array()
+            .unwrap_or(&vec![])
+            .iter()
+            .take(n)
+            .map(|r| Result_ {
+                title: r["title"].as_str().unwrap_or("").into(),
+                url: r["url"].as_str().unwrap_or("").into(),
+                snippet: r["content"].as_str().unwrap_or("").into(),
+            })
+            .collect(),
+    ))
 }
 
 async fn brave(http: &reqwest::Client, q: &str, n: usize) -> anyhow::Result<Option<Vec<Result_>>> {
     let key = std::env::var("BRAVE_API_KEY").unwrap_or_default();
-    if key.is_empty() { return Ok(None); }
-    let d: Value = http.get(format!("https://api.search.brave.com/res/v1/web/search?q={}&count={}",
-        url::form_urlencoded::byte_serialize(q.as_bytes()).collect::<String>(), n))
-        .header("X-Subscription-Token", key).header("Accept", "application/json")
-        .send().await?.json().await?;
-    Ok(Some(d["web"]["results"].as_array().unwrap_or(&vec![]).iter().take(n).map(|r| Result_ {
-        title: r["title"].as_str().unwrap_or("").into(),
-        url: r["url"].as_str().unwrap_or("").into(),
-        snippet: r["description"].as_str().unwrap_or("").into(),
-    }).collect()))
+    if key.is_empty() {
+        return Ok(None);
+    }
+    let d: Value = http
+        .get(format!(
+            "https://api.search.brave.com/res/v1/web/search?q={}&count={}",
+            url::form_urlencoded::byte_serialize(q.as_bytes()).collect::<String>(),
+            n
+        ))
+        .header("X-Subscription-Token", key)
+        .header("Accept", "application/json")
+        .send()
+        .await?
+        .json()
+        .await?;
+    Ok(Some(
+        d["web"]["results"]
+            .as_array()
+            .unwrap_or(&vec![])
+            .iter()
+            .take(n)
+            .map(|r| Result_ {
+                title: r["title"].as_str().unwrap_or("").into(),
+                url: r["url"].as_str().unwrap_or("").into(),
+                snippet: r["description"].as_str().unwrap_or("").into(),
+            })
+            .collect(),
+    ))
 }
 
 /// Exa — keyless via their public MCP endpoint `mcp.exa.ai/mcp` (the same
@@ -171,24 +221,23 @@ async fn exa(http: &reqwest::Client, q: &str, n: usize) -> anyhow::Result<Option
     // result.content[].text as "---"-separated blocks.
     let mut text = String::new();
     for line in body.lines() {
-        if let Some(data) = line.strip_prefix("data:") {
-            if let Ok(v) = serde_json::from_str::<Value>(data.trim()) {
-                if let Some(t) = v["result"]["content"].as_array().and_then(|c| {
-                    c.iter().find_map(|i| i["text"].as_str())
-                }) {
-                    text = t.to_string();
-                }
-            }
+        if let Some(data) = line.strip_prefix("data:")
+            && let Ok(v) = serde_json::from_str::<Value>(data.trim())
+            && let Some(t) = v["result"]["content"]
+                .as_array()
+                .and_then(|c| c.iter().find_map(|i| i["text"].as_str()))
+        {
+            text = t.to_string();
         }
     }
     if text.is_empty() {
         // Some deployments answer plain JSON-RPC instead of SSE.
-        if let Ok(v) = serde_json::from_str::<Value>(&body) {
-            if let Some(t) = v["result"]["content"].as_array().and_then(|c| {
-                c.iter().find_map(|i| i["text"].as_str())
-            }) {
-                text = t.to_string();
-            }
+        if let Ok(v) = serde_json::from_str::<Value>(&body)
+            && let Some(t) = v["result"]["content"]
+                .as_array()
+                .and_then(|c| c.iter().find_map(|i| i["text"].as_str()))
+        {
+            text = t.to_string();
         }
     }
     Ok(Some(parse_exa_blocks(&text)))
@@ -221,17 +270,19 @@ fn parse_exa_blocks(text: &str) -> Vec<Result_> {
 }
 
 fn bing_link(raw: &str) -> String {
-    if raw.contains("bing.com/ck/a") {
-        if let Ok(u) = url::Url::parse(&raw.replace("&amp;", "&")) {
-            for (k, v) in u.query_pairs() {
-                if k == "u" && v.len() > 2 {
-                    let stripped = &v[2..];
-                    let padded = format!("{stripped}{}", "=".repeat((4 - stripped.len() % 4) % 4));
-                    if let Ok(bytes) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(stripped)
-                        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(&padded))
-                    {
-                        if let Ok(s) = String::from_utf8(bytes) { return s; }
-                    }
+    if raw.contains("bing.com/ck/a")
+        && let Ok(u) = url::Url::parse(&raw.replace("&amp;", "&"))
+    {
+        for (k, v) in u.query_pairs() {
+            if k == "u" && v.len() > 2 {
+                let stripped = &v[2..];
+                let padded = format!("{stripped}{}", "=".repeat((4 - stripped.len() % 4) % 4));
+                if let Ok(bytes) = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(stripped)
+                    .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(&padded))
+                    && let Ok(s) = String::from_utf8(bytes)
+                {
+                    return s;
                 }
             }
         }
@@ -242,10 +293,14 @@ fn bing_link(raw: &str) -> String {
 async fn bing(http: &reqwest::Client, q: &str, n: usize) -> anyhow::Result<Option<Vec<Result_>>> {
     // adlt=strict + cc=US: force SafeSearch on and pin the market — the
     // geo/low-trust tier is where the porn-spam SERPs come from.
-    let url = format!("https://www.bing.com/search?q={}&count={}&mkt=en-US&setlang=en&cc=US&adlt=strict",
-        url::form_urlencoded::byte_serialize(q.as_bytes()).collect::<String>(), n);
+    let url = format!(
+        "https://www.bing.com/search?q={}&count={}&mkt=en-US&setlang=en&cc=US&adlt=strict",
+        url::form_urlencoded::byte_serialize(q.as_bytes()).collect::<String>(),
+        n
+    );
     let html = http.get(&url).send().await?.text().await?;
     let re = Regex::new(r#"(?s)<h2[^>]*><a[^>]*href="([^"]+)"[^>]*>(.*?)</a></h2>"#)?;
+    let snippet_re = Regex::new(r"(?s)<p[^>]*>(.*?)</p>")?;
     let mut out = vec![];
     for c in re.captures_iter(&html) {
         let title = strip_tags(&c[2]);
@@ -255,10 +310,19 @@ async fn bing(http: &reqwest::Client, q: &str, n: usize) -> anyhow::Result<Optio
             stop -= 1;
         }
         let window = &html[end..stop];
-        let snippet = Regex::new(r"(?s)<p[^>]*>(.*?)</p>")?.captures(window)
-            .and_then(|p| p.get(1)).map(|p| strip_tags(p.as_str())).unwrap_or_default();
-        out.push(Result_ { title, url: bing_link(&c[1]), snippet });
-        if out.len() >= n { break; }
+        let snippet = snippet_re
+            .captures(window)
+            .and_then(|p| p.get(1))
+            .map(|p| strip_tags(p.as_str()))
+            .unwrap_or_default();
+        out.push(Result_ {
+            title,
+            url: bing_link(&c[1]),
+            snippet,
+        });
+        if out.len() >= n {
+            break;
+        }
     }
     // Bing serves spam/poisoned SERPs to scrape UAs (tech queries have
     // returned literal porn listings). A poisoned page shares no vocabulary
@@ -284,8 +348,8 @@ async fn bing(http: &reqwest::Client, q: &str, n: usize) -> anyhow::Result<Optio
 /// but the poison case (zero overlap anywhere) is what matters.
 fn result_relevant(query: &str, r: &Result_) -> bool {
     const STOP: [&str; 16] = [
-        "the", "and", "for", "how", "what", "with", "you", "are", "not",
-        "all", "can", "this", "that", "from", "your", "use",
+        "the", "and", "for", "how", "what", "with", "you", "are", "not", "all", "can", "this",
+        "that", "from", "your", "use",
     ];
     let words: Vec<String> = query
         .to_lowercase()
@@ -307,15 +371,27 @@ fn result_relevant(query: &str, r: &Result_) -> bool {
     words.is_empty() || words.iter().any(|w| hay.contains(w.as_str()))
 }
 
-async fn duckduckgo_html(http: &reqwest::Client, q: &str, n: usize) -> anyhow::Result<Option<Vec<Result_>>> {
-    let url = format!("https://html.duckduckgo.com/html/?q={}",
-        url::form_urlencoded::byte_serialize(q.as_bytes()).collect::<String>());
+async fn duckduckgo_html(
+    http: &reqwest::Client,
+    q: &str,
+    n: usize,
+) -> anyhow::Result<Option<Vec<Result_>>> {
+    let url = format!(
+        "https://html.duckduckgo.com/html/?q={}",
+        url::form_urlencoded::byte_serialize(q.as_bytes()).collect::<String>()
+    );
     let html = http.get(&url).send().await?.text().await?;
     let re = Regex::new(r#"(?s)class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>"#)?;
     let mut out = vec![];
     for c in re.captures_iter(&html) {
-        out.push(Result_ { title: strip_tags(&c[2]), url: ddg_link(&c[1]), snippet: String::new() });
-        if out.len() >= n { break; }
+        out.push(Result_ {
+            title: strip_tags(&c[2]),
+            url: ddg_link(&c[1]),
+            snippet: String::new(),
+        });
+        if out.len() >= n {
+            break;
+        }
     }
     Ok(if out.is_empty() { None } else { Some(out) })
 }
@@ -337,7 +413,11 @@ fn ddg_link(raw: &str) -> String {
 /// `lite.duckduckgo.com` — a POST form and a bare table; the most
 /// scrape-friendly DDG surface. Runs when the html endpoint answers an
 /// empty/blocked page.
-async fn duckduckgo_lite(http: &reqwest::Client, q: &str, n: usize) -> anyhow::Result<Option<Vec<Result_>>> {
+async fn duckduckgo_lite(
+    http: &reqwest::Client,
+    q: &str,
+    n: usize,
+) -> anyhow::Result<Option<Vec<Result_>>> {
     let html = http
         .post("https://lite.duckduckgo.com/lite/")
         .form(&[("q", q)])
@@ -353,12 +433,18 @@ async fn duckduckgo_lite(http: &reqwest::Client, q: &str, n: usize) -> anyhow::R
             url: ddg_link(&c[1]),
             snippet: String::new(),
         });
-        if out.len() >= n { break; }
+        if out.len() >= n {
+            break;
+        }
     }
     Ok(if out.is_empty() { None } else { Some(out) })
 }
 
-async fn duckduckgo(http: &reqwest::Client, q: &str, n: usize) -> anyhow::Result<Option<Vec<Result_>>> {
+async fn duckduckgo(
+    http: &reqwest::Client,
+    q: &str,
+    n: usize,
+) -> anyhow::Result<Option<Vec<Result_>>> {
     match duckduckgo_html(http, q, n).await {
         Ok(Some(r)) => Ok(Some(r)),
         Ok(None) => duckduckgo_lite(http, q, n).await,
@@ -383,7 +469,9 @@ async fn github(http: &reqwest::Client, q: &str, n: usize) -> anyhow::Result<Opt
     // full query -> meta-words ("github"/"repo") dropped -> top two tokens.
     let mut tried = std::collections::HashSet::new();
     for variant in github_query_variants(q) {
-        if !tried.insert(variant.clone()) { continue; }
+        if !tried.insert(variant.clone()) {
+            continue;
+        }
         let d: Value = http
             .get(format!(
                 "https://api.github.com/search/repositories?q={}&per_page={}",
@@ -399,7 +487,9 @@ async fn github(http: &reqwest::Client, q: &str, n: usize) -> anyhow::Result<Opt
         let mut out = vec![];
         for it in d["items"].as_array().into_iter().flatten() {
             let url = it["html_url"].as_str().unwrap_or_default();
-            if url.is_empty() { continue; }
+            if url.is_empty() {
+                continue;
+            }
             let name = it["full_name"].as_str().unwrap_or_default();
             let desc = it["description"].as_str().unwrap_or_default();
             let stars = it["stargazers_count"].as_u64().unwrap_or(0);
@@ -408,10 +498,14 @@ async fn github(http: &reqwest::Client, q: &str, n: usize) -> anyhow::Result<Opt
                 url: url.to_string(),
                 snippet: format!("\u{2605}{stars} \u{2014} {desc}"),
             });
-            if out.len() >= n { break; }
+            if out.len() >= n {
+                break;
+            }
         }
         let kept: Vec<_> = out.into_iter().filter(|r| result_relevant(q, r)).collect();
-        if !kept.is_empty() { return Ok(Some(kept)); }
+        if !kept.is_empty() {
+            return Ok(Some(kept));
+        }
     }
     Ok(None)
 }
@@ -431,9 +525,20 @@ fn github_query_variants(q: &str) -> Vec<String> {
     v.into_iter().filter(|s| !s.trim().is_empty()).collect()
 }
 
-type Provider<'a> = fn(&'a reqwest::Client, &'a str, usize) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<Option<Vec<Result_>>>> + Send + 'a>>;
+type Provider<'a> = fn(
+    &'a reqwest::Client,
+    &'a str,
+    usize,
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = anyhow::Result<Option<Vec<Result_>>>> + Send + 'a>,
+>;
 
-async fn search(http: &reqwest::Client, query: &str, n: usize, pinned: Option<&str>) -> Result<(String, Vec<Value>), String> {
+async fn search(
+    http: &reqwest::Client,
+    query: &str,
+    n: usize,
+    pinned: Option<&str>,
+) -> Result<(String, Vec<Value>), String> {
     let providers: [(&str, Provider<'_>); 7] = [
         ("searxng", |h, q, n| Box::pin(searxng(h, q, n))),
         ("tavily", |h, q, n| Box::pin(tavily(h, q, n))),
@@ -445,14 +550,22 @@ async fn search(http: &reqwest::Client, query: &str, n: usize, pinned: Option<&s
     ];
     let mut errors = vec![];
     for (name, f) in providers {
-        if let Some(p) = pinned { if p != name { continue; } }
+        if let Some(p) = pinned
+            && p != name
+        {
+            continue;
+        }
         match f(http, query, n).await {
             Ok(Some(r)) if !r.is_empty() => return Ok((name.to_string(), to_json(r))),
             Ok(_) => {}
             Err(e) => errors.push(format!("{name}: {e}")),
         }
     }
-    Err(if errors.is_empty() { "no provider configured".into() } else { errors.join("; ") })
+    Err(if errors.is_empty() {
+        "no provider configured".into()
+    } else {
+        errors.join("; ")
+    })
 }
 
 const USAGE: &str = "usage: gray-search <query>
@@ -487,7 +600,9 @@ fn main() {
         None => {}
     }
     if std::io::stdin().is_terminal() {
-        eprintln!("gray-search is a plugin sidecar — drive it via `gray search <query>` or install with `gray plugin install`");
+        eprintln!(
+            "gray-search is a plugin sidecar — drive it via `gray search <query>` or install with `gray plugin install`"
+        );
         return;
     }
     if let Err(e) = run() {
@@ -523,7 +638,9 @@ async fn call_tool(params: Value, http: &HttpCell) -> Value {
                 let n = args.get("max_results").and_then(Value::as_u64).unwrap_or(8) as usize;
                 let pinned = args.get("provider").and_then(Value::as_str);
                 match search(http, q, n, pinned).await {
-                    Ok((pname, results)) => json!({"content": serde_json::to_string_pretty(&json!({"provider": pname, "results": results})).unwrap_or_default().chars().take(8000).collect::<String>()}),
+                    Ok((pname, results)) => {
+                        json!({"content": serde_json::to_string_pretty(&json!({"provider": pname, "results": results})).unwrap_or_default().chars().take(8000).collect::<String>()})
+                    }
                     Err(e) => json!({"content": format!("error: {e}"), "is_error": true}),
                 }
             }
@@ -532,13 +649,20 @@ async fn call_tool(params: Value, http: &HttpCell) -> Value {
             Err(e) => json!({"content": format!("error: {e:#}"), "is_error": true}),
             Ok(http) => {
                 let url = args.get("url").and_then(Value::as_str).unwrap_or("");
-                let max = args.get("max_chars").and_then(Value::as_u64).unwrap_or(8000) as usize;
+                let max = args
+                    .get("max_chars")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(8000) as usize;
                 match http.get(url).send().await {
                     Ok(resp) => {
                         let status = resp.status();
                         match resp.text().await {
-                            Ok(html) if status.is_success() => json!({"content": strip_tags(&html).chars().take(max).collect::<String>()}),
-                            Ok(_) => json!({"content": format!("error: HTTP {status} fetching {url}"), "is_error": true}),
+                            Ok(html) if status.is_success() => {
+                                json!({"content": strip_tags(&html).chars().take(max).collect::<String>()})
+                            }
+                            Ok(_) => {
+                                json!({"content": format!("error: HTTP {status} fetching {url}"), "is_error": true})
+                            }
                             Err(e) => json!({"content": format!("error: {e}"), "is_error": true}),
                         }
                     }
@@ -559,17 +683,27 @@ fn write_response(stdout: &Mutex<std::io::Stdout>, response: &Value) -> anyhow::
 
 #[tokio::main(flavor = "multi_thread")]
 async fn run() -> anyhow::Result<()> {
-    let mut lines = tokio::io::AsyncBufReadExt::lines(tokio::io::BufReader::new(tokio::io::stdin()));
+    let mut lines =
+        tokio::io::AsyncBufReadExt::lines(tokio::io::BufReader::new(tokio::io::stdin()));
     // Nothing fallible may run between here and the read loop: the host
     // treats a pre-handshake exit as a spawn failure. The HTTP client is
     // built on first tool use instead.
     let http = Arc::new(HttpCell::new());
     let stdout = Arc::new(Mutex::new(std::io::stdout()));
     while let Some(line) = lines.next_line().await? {
-        if line.trim().is_empty() { continue; }
-        let request: Request = match serde_json::from_str(&line) { Ok(r) => r, Err(_) => continue };
-        if request.method == "plugin/shutdown" { break; }
-        if request.id.is_null() { continue; }
+        if line.trim().is_empty() {
+            continue;
+        }
+        let request: Request = match serde_json::from_str(&line) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        if request.method == "plugin/shutdown" {
+            break;
+        }
+        if request.id.is_null() {
+            continue;
+        }
         let params = request.params.clone().unwrap_or_else(|| json!({}));
         if request.method == "tool/call" {
             let http = Arc::clone(&http);
@@ -584,12 +718,22 @@ async fn run() -> anyhow::Result<()> {
         let reply: anyhow::Result<Value> = match request.method.as_str() {
             "plugin/manifest" => Ok(manifest_json()),
             "command/run" => {
-                let argv: Vec<String> = params.get("argv").and_then(Value::as_array)
-                    .map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect()).unwrap_or_default();
+                let argv: Vec<String> = params
+                    .get("argv")
+                    .and_then(Value::as_array)
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(Value::as_str)
+                            .map(String::from)
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 match http_client(&http).await {
                     Err(e) => Ok(json!({"text": format!("search failed: {e:#}")})),
                     Ok(http) => match search(http, &argv.join(" "), 8, None).await {
-                        Ok((name, results)) => Ok(json!({"text": format!("[{name}] {}", serde_json::to_string_pretty(&results).unwrap_or_default()).chars().take(4000).collect::<String>()})),
+                        Ok((name, results)) => Ok(
+                            json!({"text": format!("[{name}] {}", serde_json::to_string_pretty(&results).unwrap_or_default()).chars().take(4000).collect::<String>()}),
+                        ),
                         Err(e) => Ok(json!({"text": format!("search failed: {e}")})),
                     },
                 }
