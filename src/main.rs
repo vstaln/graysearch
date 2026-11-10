@@ -221,26 +221,23 @@ async fn exa(http: &reqwest::Client, q: &str, n: usize) -> anyhow::Result<Option
     // result.content[].text as "---"-separated blocks.
     let mut text = String::new();
     for line in body.lines() {
-        if let Some(data) = line.strip_prefix("data:") {
-            if let Ok(v) = serde_json::from_str::<Value>(data.trim()) {
-                if let Some(t) = v["result"]["content"]
-                    .as_array()
-                    .and_then(|c| c.iter().find_map(|i| i["text"].as_str()))
-                {
-                    text = t.to_string();
-                }
-            }
+        if let Some(data) = line.strip_prefix("data:")
+            && let Ok(v) = serde_json::from_str::<Value>(data.trim())
+            && let Some(t) = v["result"]["content"]
+                .as_array()
+                .and_then(|c| c.iter().find_map(|i| i["text"].as_str()))
+        {
+            text = t.to_string();
         }
     }
     if text.is_empty() {
         // Some deployments answer plain JSON-RPC instead of SSE.
-        if let Ok(v) = serde_json::from_str::<Value>(&body) {
-            if let Some(t) = v["result"]["content"]
+        if let Ok(v) = serde_json::from_str::<Value>(&body)
+            && let Some(t) = v["result"]["content"]
                 .as_array()
                 .and_then(|c| c.iter().find_map(|i| i["text"].as_str()))
-            {
-                text = t.to_string();
-            }
+        {
+            text = t.to_string();
         }
     }
     Ok(Some(parse_exa_blocks(&text)))
@@ -273,20 +270,19 @@ fn parse_exa_blocks(text: &str) -> Vec<Result_> {
 }
 
 fn bing_link(raw: &str) -> String {
-    if raw.contains("bing.com/ck/a") {
-        if let Ok(u) = url::Url::parse(&raw.replace("&amp;", "&")) {
-            for (k, v) in u.query_pairs() {
-                if k == "u" && v.len() > 2 {
-                    let stripped = &v[2..];
-                    let padded = format!("{stripped}{}", "=".repeat((4 - stripped.len() % 4) % 4));
-                    if let Ok(bytes) = base64::engine::general_purpose::URL_SAFE_NO_PAD
-                        .decode(stripped)
-                        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(&padded))
-                    {
-                        if let Ok(s) = String::from_utf8(bytes) {
-                            return s;
-                        }
-                    }
+    if raw.contains("bing.com/ck/a")
+        && let Ok(u) = url::Url::parse(&raw.replace("&amp;", "&"))
+    {
+        for (k, v) in u.query_pairs() {
+            if k == "u" && v.len() > 2 {
+                let stripped = &v[2..];
+                let padded = format!("{stripped}{}", "=".repeat((4 - stripped.len() % 4) % 4));
+                if let Ok(bytes) = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(stripped)
+                    .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(&padded))
+                    && let Ok(s) = String::from_utf8(bytes)
+                {
+                    return s;
                 }
             }
         }
@@ -304,6 +300,7 @@ async fn bing(http: &reqwest::Client, q: &str, n: usize) -> anyhow::Result<Optio
     );
     let html = http.get(&url).send().await?.text().await?;
     let re = Regex::new(r#"(?s)<h2[^>]*><a[^>]*href="([^"]+)"[^>]*>(.*?)</a></h2>"#)?;
+    let snippet_re = Regex::new(r"(?s)<p[^>]*>(.*?)</p>")?;
     let mut out = vec![];
     for c in re.captures_iter(&html) {
         let title = strip_tags(&c[2]);
@@ -313,7 +310,7 @@ async fn bing(http: &reqwest::Client, q: &str, n: usize) -> anyhow::Result<Optio
             stop -= 1;
         }
         let window = &html[end..stop];
-        let snippet = Regex::new(r"(?s)<p[^>]*>(.*?)</p>")?
+        let snippet = snippet_re
             .captures(window)
             .and_then(|p| p.get(1))
             .map(|p| strip_tags(p.as_str()))
@@ -553,10 +550,10 @@ async fn search(
     ];
     let mut errors = vec![];
     for (name, f) in providers {
-        if let Some(p) = pinned {
-            if p != name {
-                continue;
-            }
+        if let Some(p) = pinned
+            && p != name
+        {
+            continue;
         }
         match f(http, query, n).await {
             Ok(Some(r)) if !r.is_empty() => return Ok((name.to_string(), to_json(r))),
