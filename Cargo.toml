@@ -4,6 +4,7 @@ version = "0.1.3"
 edition = "2024"
 rust-version = "1.91"
 license = "MIT"
+description = "Web search tools (web_search, web_fetch) and /search for Gray agents."
 
 [dependencies]
 anyhow = "1"
