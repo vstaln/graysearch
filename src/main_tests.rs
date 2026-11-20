@@ -33,7 +33,7 @@ fn bing_link_decodes_with_amp_escapes() {
 async fn search_unknown_pinned_provider_errors_without_network() {
     let http = ua_client().unwrap();
     let err = search(&http, "q", 1, Some("nope")).await.unwrap_err();
-    assert_eq!(err, "no provider configured");
+    assert_eq!(err, "unknown provider 'nope'");
 }
 
 #[tokio::test]
@@ -44,7 +44,7 @@ async fn search_with_no_keys_and_invalid_pinned_falls_through_all() {
     // beyond this point. Edition 2024 marks set_var unsafe.
     unsafe { std::env::set_var("SEARXNG_BASE_URL", "") };
     let err = search(&http, "q", 1, Some("searxng")).await.unwrap_err();
-    assert_eq!(err, "no provider configured");
+    assert_eq!(err, "searxng: no results (or its key is not set)");
 }
 
 #[test]

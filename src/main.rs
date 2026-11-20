@@ -548,6 +548,11 @@ async fn search(
         ("bing", |h, q, n| Box::pin(bing(h, q, n))),
         ("github", |h, q, n| Box::pin(github(h, q, n))),
     ];
+    if let Some(p) = pinned
+        && !providers.iter().any(|(name, _)| *name == p)
+    {
+        return Err(format!("unknown provider '{p}'"));
+    }
     let mut errors = vec![];
     for (name, f) in providers {
         if let Some(p) = pinned
@@ -561,10 +566,10 @@ async fn search(
             Err(e) => errors.push(format!("{name}: {e}")),
         }
     }
-    Err(if errors.is_empty() {
-        "no provider configured".into()
-    } else {
-        errors.join("; ")
+    Err(match (errors.is_empty(), pinned) {
+        (false, _) => errors.join("; "),
+        (true, Some(p)) => format!("{p}: no results (or its key is not set)"),
+        (true, None) => "no results from any provider; try a shorter query".into(),
     })
 }
 
