@@ -55,8 +55,8 @@ fn manifest_json() -> Value {
     json!({
         "name": "search", "version": env!("CARGO_PKG_VERSION"), "protocol": "1.1",
         "tools": [
-            {"name": "web_search", "description": "Search the web (keyless: tavily, exa, duckduckgo, bing, github; better with SEARXNG_BASE_URL, TAVILY_API_KEY, BRAVE_API_KEY, or EXA_API_KEY set)", "parameters": {"type": "object", "properties": {"query": {"type": "string"}, "max_results": {"type": "integer"}, "provider": {"type": "string"}}, "required": ["query"]}, "snippet": "web_search <query>", "read_only": true},
-            {"name": "web_fetch", "description": "Fetch a URL and return its text content", "parameters": {"type": "object", "properties": {"url": {"type": "string"}, "max_chars": {"type": "integer"}}, "required": ["url"]}, "snippet": "web_fetch <url>", "read_only": true}
+            {"name": "web_search", "label": "Searched", "preview": "\"{query}\"", "description": "Search the web (keyless: tavily, exa, duckduckgo, bing, github; better with SEARXNG_BASE_URL, TAVILY_API_KEY, BRAVE_API_KEY, or EXA_API_KEY set)", "parameters": {"type": "object", "properties": {"query": {"type": "string"}, "max_results": {"type": "integer"}, "provider": {"type": "string"}}, "required": ["query"]}, "snippet": "web_search <query>", "read_only": true},
+            {"name": "web_fetch", "label": "Fetched", "preview": "{url}", "description": "Fetch a URL and return its text content", "parameters": {"type": "object", "properties": {"url": {"type": "string"}, "max_chars": {"type": "integer"}}, "required": ["url"]}, "snippet": "web_fetch <url>", "read_only": true}
         ],
         "commands": ["/search"], "hooks": [],
     })
