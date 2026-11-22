@@ -195,7 +195,6 @@ async fn brave(http: &reqwest::Client, q: &str, n: usize) -> anyhow::Result<Opti
 /// Exa — keyless via their public MCP endpoint `mcp.exa.ai/mcp` (the same
 /// path opencode uses): a JSON-RPC `tools/call` on `web_search_exa`
 /// answers over streamable HTTP without an initialize handshake.
-/// EXA_API_KEY rides the `x-api-key` header Exa documents, never the URL.
 async fn exa(http: &reqwest::Client, q: &str, n: usize) -> anyhow::Result<Option<Vec<Result_>>> {
     let key = std::env::var("EXA_API_KEY").unwrap_or_default();
     let mut request = http
