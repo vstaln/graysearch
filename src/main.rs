@@ -55,8 +55,8 @@ fn manifest_json() -> Value {
     json!({
         "name": "search", "version": env!("CARGO_PKG_VERSION"), "protocol": "1.1",
         "tools": [
-            {"name": "web_search", "label": "Searched", "preview": "\"{query}\"", "description": "Search the web (keyless: tavily, exa, duckduckgo, bing, github; better with SEARXNG_BASE_URL, TAVILY_API_KEY, BRAVE_API_KEY, or EXA_API_KEY set)", "parameters": {"type": "object", "properties": {"query": {"type": "string"}, "max_results": {"type": "integer"}, "provider": {"type": "string"}}, "required": ["query"]}, "snippet": "web_search <query>", "read_only": true},
-            {"name": "web_fetch", "label": "Fetched", "preview": "{url}", "description": "Fetch a URL and return its text content", "parameters": {"type": "object", "properties": {"url": {"type": "string"}, "max_chars": {"type": "integer"}}, "required": ["url"]}, "snippet": "web_fetch <url>", "read_only": true}
+            {"name": "web_search", "direct": true, "label": "Searched", "preview": "\"{query}\"", "description": "Search the web (keyless: tavily, exa, duckduckgo, bing, github; better with SEARXNG_BASE_URL, TAVILY_API_KEY, BRAVE_API_KEY, or EXA_API_KEY set)", "parameters": {"type": "object", "properties": {"query": {"type": "string"}, "max_results": {"type": "integer"}, "provider": {"type": "string"}}, "required": ["query"]}, "snippet": "web_search <query>", "read_only": true},
+            {"name": "web_fetch", "direct": true, "label": "Fetched", "preview": "{url}", "description": "Fetch a URL and return its text content", "parameters": {"type": "object", "properties": {"url": {"type": "string"}, "max_chars": {"type": "integer"}}, "required": ["url"]}, "snippet": "web_fetch <url>", "read_only": true}
         ],
         "commands": ["/search"], "hooks": [],
     })
@@ -195,17 +195,15 @@ async fn brave(http: &reqwest::Client, q: &str, n: usize) -> anyhow::Result<Opti
 /// Exa — keyless via their public MCP endpoint `mcp.exa.ai/mcp` (the same
 /// path opencode uses): a JSON-RPC `tools/call` on `web_search_exa`
 /// answers over streamable HTTP without an initialize handshake.
-/// EXA_API_KEY is appended as `?exaApiKey=` when configured.
 async fn exa(http: &reqwest::Client, q: &str, n: usize) -> anyhow::Result<Option<Vec<Result_>>> {
     let key = std::env::var("EXA_API_KEY").unwrap_or_default();
-    let endpoint = if key.is_empty() {
-        "https://mcp.exa.ai/mcp".to_string()
-    } else {
-        format!("https://mcp.exa.ai/mcp?exaApiKey={key}")
-    };
-    let body = http
-        .post(endpoint)
-        .header("Accept", "application/json, text/event-stream")
+    let mut request = http
+        .post("https://mcp.exa.ai/mcp")
+        .header("Accept", "application/json, text/event-stream");
+    if !key.is_empty() {
+        request = request.header("x-api-key", key);
+    }
+    let body = request
         .json(&json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -213,34 +211,67 @@ async fn exa(http: &reqwest::Client, q: &str, n: usize) -> anyhow::Result<Option
             "params": {"name": "web_search_exa", "arguments": {"query": q, "numResults": n}},
         }))
         .send()
-        .await?
-        .error_for_status()?
+        .await
+        .and_then(|r| r.error_for_status())
+        .map_err(without_url)?
         .text()
-        .await?;
+        .await
+        .map_err(without_url)?;
     // Streamable-HTTP SSE: results ride the last `data:` line's
     // result.content[].text as "---"-separated blocks.
-    let mut text = String::new();
+    let mut found = ExaFrame::default();
     for line in body.lines() {
         if let Some(data) = line.strip_prefix("data:")
             && let Ok(v) = serde_json::from_str::<Value>(data.trim())
-            && let Some(t) = v["result"]["content"]
-                .as_array()
-                .and_then(|c| c.iter().find_map(|i| i["text"].as_str()))
         {
-            text = t.to_string();
+            found.absorb(&v);
         }
     }
-    if text.is_empty() {
+    if found.text.is_empty() {
         // Some deployments answer plain JSON-RPC instead of SSE.
-        if let Ok(v) = serde_json::from_str::<Value>(&body)
-            && let Some(t) = v["result"]["content"]
-                .as_array()
-                .and_then(|c| c.iter().find_map(|i| i["text"].as_str()))
-        {
-            text = t.to_string();
+        if let Ok(v) = serde_json::from_str::<Value>(&body) {
+            found.absorb(&v);
         }
     }
-    Ok(Some(parse_exa_blocks(&text)))
+    if found.text.is_empty()
+        && let Some(f) = found.failure
+    {
+        anyhow::bail!("{}", f.trim());
+    }
+    Ok(Some(parse_exa_blocks(&found.text)))
+}
+
+#[derive(Default)]
+struct ExaFrame {
+    text: String,
+    failure: Option<String>,
+}
+
+impl ExaFrame {
+    fn absorb(&mut self, v: &Value) {
+        if let Some(err) = v.get("error") {
+            let msg = err["message"]
+                .as_str()
+                .or_else(|| err.as_str())
+                .unwrap_or("JSON-RPC error");
+            self.failure = Some(msg.to_string());
+            return;
+        }
+        if let Some(t) = v["result"]["content"]
+            .as_array()
+            .and_then(|c| c.iter().find_map(|i| i["text"].as_str()))
+        {
+            if v["result"]["isError"].as_bool().unwrap_or(false) {
+                self.failure = Some(t.to_string());
+            } else {
+                self.text = t.to_string();
+            }
+        }
+    }
+}
+
+fn without_url(e: reqwest::Error) -> anyhow::Error {
+    anyhow::Error::new(e.without_url())
 }
 
 /// Split Exa's "Title:/URL:/Highlights:" text blocks into results — a
